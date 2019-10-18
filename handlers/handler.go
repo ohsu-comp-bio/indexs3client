@@ -1,19 +1,32 @@
 package handlers
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
 type IndexdInfo struct {
-	URL      string `url`
-	Username string `username`
-	Password string `password`
+	URL              string `json:"url"`
+	Username         string `json:"username"`
+	Password         string `json:"password"`
+	ExtramuralBucket bool   `json:"extramural_bucket"`
+
+	ExtramuralUploader         *string `json:"extramural_uploader"`
+	ExtramuralUploaderS3Owner  bool    `json:"extramural_uploader_s3owner"`
+	ExtramuralUploaderManifest *string `json:"extramural_uploader_manifest"`
+}
+
+type IndexdRecord struct {
+	DID    string `json:"did"`
+	BaseID string `json:"baseid"`
+	Rev    string `json:"rev"`
 }
 
 func minOf(vars ...int64) int64 {
@@ -47,19 +60,7 @@ func IndexS3Object(s3objectURL string) {
 	}
 	bucket, key := u.Host, u.Path
 
-	// key looks like one of these:
-	//
-	//     <uuid>/<filename>
-	//     <dataguid>/<uuid>/<filename>
-	//
-	// we want to keep the `<dataguid>/<uuid>` part
-	split_key := strings.Split(key, "/")
-	var uuid string
-	if len(split_key) == 2 {
-		uuid = split_key[0]
-	} else {
-		uuid = strings.Join(split_key[:len(split_key)-1], "/")
-	}
+	indexdInfo, _ := getIndexServiceInfo()
 
 	client, err := CreateNewAwsClient()
 	if err != nil {
@@ -76,20 +77,117 @@ func IndexS3Object(s3objectURL string) {
 	}
 	log.Printf("Finish to compute hashes for %s", key)
 
-	indexdInfo, _ := getIndexServiceInfo()
-	rev, err := GetIndexdRecordRev(uuid, indexdInfo.URL)
-	if err != nil {
-		log.Println(err)
-		return
+	var uuid, rev string
+
+	// Create the indexd record if this is an ExtramuralBucket and it doesn't already exist
+	if indexdInfo.ExtramuralBucket {
+
+		// search indexd to see if the record already exists
+		if foundIndexdRecord, err := GetIndexdRecordByURL(indexdInfo, s3objectURL); err == nil {
+			uuid = foundIndexdRecord.DID
+			rev = foundIndexdRecord.Rev
+		} else {
+			var uploader string
+
+			if indexdInfo.ExtramuralUploader != nil {
+				uploader = *(indexdInfo.ExtramuralUploader)
+			} else if indexdInfo.ExtramuralUploaderS3Owner {
+				s3owner, err := GetS3BucketOwner(client, bucket)
+				if err != nil {
+					panic(err) // Should always be able to fetch owner, something bad happened if not
+				}
+
+				uploader = s3owner
+			} else if indexdInfo.ExtramuralUploaderManifest != nil {
+				// Read from manifest, try to find uploader.
+				// if fail, default to empty string
+				oo, err := GetS3ObjectOutput(client, bucket, *indexdInfo.ExtramuralUploaderManifest)
+				if err == nil {
+					uploader = FindUploaderInManifest(key, oo.Body)
+				} else {
+					log.Println(err)
+				}
+			}
+
+			body, _ := json.Marshal(struct {
+				Uploader string `json:"uploader"`
+				Filename string `json:"file_name"`
+			}{
+				uploader, filepath.Base(key),
+			})
+
+			indexdRecord, err := CreateBlankIndexdRecord(indexdInfo, body)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			uuid = indexdRecord.DID
+			rev = indexdRecord.Rev
+		}
+
+	} else {
+		// key looks like one of these:
+		//
+		//     <uuid>/<filename>
+		//     <dataguid>/<uuid>/<filename>
+		//
+		// we want to keep the `<dataguid>/<uuid>` part
+		split_key := strings.Split(key, "/")
+		if len(split_key) == 2 {
+			uuid = split_key[0]
+		} else {
+			uuid = strings.Join(split_key[:len(split_key)-1], "/")
+		}
+
+		if uuid == "" {
+			panic("Are you trying to index a non-Gen3 managed S3 bucket? Try setting 'extramural_bucket: true' in the config, no UUID found in object path.")
+		}
+
+		rev, err = GetIndexdRecordRev(uuid, indexdInfo.URL)
+		if err != nil {
+			log.Println(err)
+			return
+		}
 	}
 
-	body := fmt.Sprintf(`{"size": %d, "urls": ["%s"], "hashes": {"md5": "%s", "sha1":"%s", "sha256": "%s", "sha512": "%s", "crc": "%s"}}`,
-		objectSize, s3objectURL, hashes.Md5, hashes.Sha1, hashes.Sha256, hashes.Sha512, hashes.Crc32c)
-	resp, err := UpdateIndexdRecord(uuid, rev, indexdInfo, []byte(body))
+	body, _ := json.Marshal(struct {
+		Size   int64     `json:"size"`
+		URLs   []string  `json:"urls"`
+		Hashes *HashInfo `json:"hashes"`
+	}{
+		objectSize, []string{s3objectURL}, hashes,
+	})
+
+	resp, err := UpdateIndexdRecord(uuid, rev, indexdInfo, body)
 	if err != nil {
 		log.Println(err)
 	}
 
 	log.Printf("Finish updating the record. Response Status: %s", resp.Status)
 
+}
+
+func FindUploaderInManifest(object string, oo io.Reader) string {
+	uploader := ""
+
+	manifest := csv.NewReader(oo)
+	manifestRecords, err := manifest.ReadAll()
+	if err == nil {
+		uploaderMap := make(map[string]string)
+
+		for _, row := range manifestRecords {
+			uploaderMap[row[0]] = row[1]
+		}
+
+		if val, ok := uploaderMap[object]; ok {
+			uploader = val
+		} else {
+			log.Printf("Object %s not found in uploader manifest file", object)
+		}
+	} else {
+		log.Println(err)
+	}
+
+	return uploader
 }
