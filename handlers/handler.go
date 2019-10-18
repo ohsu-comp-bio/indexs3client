@@ -43,7 +43,7 @@ func minOf(vars ...int64) int64 {
 func getIndexServiceInfo() (*IndexdInfo, error) {
 	indexdInfo := new(IndexdInfo)
 	if err := json.Unmarshal([]byte(os.Getenv("CONFIG_FILE")), indexdInfo); err != nil {
-		return nil, errors.New("Enviroiment variable CONFIG_FILE is not set correctly")
+		return nil, errors.New("Environment variable CONFIG_FILE is not set correctly")
 	}
 	return indexdInfo, nil
 }
